@@ -1,0 +1,4 @@
+.env
+**/__pycache__/
+*_faiss.db
+faiss_index
