@@ -134,3 +134,31 @@ def get_agent(model_name: str | None = None):
         _AGENT_CACHE[selected_model] = build_agent(selected_model)
 
     return _AGENT_CACHE[selected_model]
+
+
+async def get_thread_latest_checkpoint(thread_id: str):
+    """Return the latest checkpoint tuple for a given thread_id, or None."""
+    if _CHECKPOINTER is None:
+        raise RuntimeError("Agent runtime is not active; checkpointer unavailable.")
+    config = {"configurable": {"thread_id": thread_id}}
+    # Ensure the saver is initialized
+    await _CHECKPOINTER.setup()
+    tup = await _CHECKPOINTER.aget_tuple(config)
+    if tup is None:
+        return None
+    # Return JSON-serializable parts of the checkpoint tuple
+    return {
+        "config": tup.config,
+        "checkpoint": tup.checkpoint,
+        "metadata": tup.metadata,
+        "parent_config": tup.parent_config,
+        "has_pending_writes": bool(tup.pending_writes),
+    }
+
+
+async def delete_thread_checkpoints(thread_id: str):
+    """Delete all stored checkpoints and writes for a thread."""
+    if _CHECKPOINTER is None:
+        raise RuntimeError("Agent runtime is not active; checkpointer unavailable.")
+    await _CHECKPOINTER.setup()
+    await _CHECKPOINTER.adelete_thread(thread_id)

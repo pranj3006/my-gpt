@@ -1073,6 +1073,40 @@ async def _create_chat_run(
     )
 
 
+@app.get("/api/conversations/{thread_id}/langgraph_state")
+async def get_langgraph_state(thread_id: str, user: dict[str, str] = Depends(authenticated_user)):
+    """Return the latest LangGraph checkpoint for a conversation thread, if present."""
+    try:
+        db.get_owned_conversation(thread_id, user["id"])
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    import agents as agents_mod
+
+    try:
+        state = await agents_mod.get_thread_latest_checkpoint(thread_id)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    if state is None:
+        raise HTTPException(status_code=404, detail="No LangGraph checkpoint found for this thread.")
+    return state
+
+
+@app.delete("/api/conversations/{thread_id}/langgraph_state")
+async def delete_langgraph_state(thread_id: str, user: dict[str, str] = Depends(authenticated_user)):
+    """Delete LangGraph checkpoints for a thread (useful for troubleshooting)."""
+    try:
+        db.get_owned_conversation(thread_id, user["id"])
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    import agents as agents_mod
+
+    try:
+        await agents_mod.delete_thread_checkpoints(thread_id)
+    except RuntimeError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {"deleted": True}
+
+
 @app.post(
     "/api/conversations/{thread_id}/runs",
     response_model=ChatRunCreated,
