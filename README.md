@@ -18,7 +18,7 @@ The UI should remain independent of any specific model provider or orchestration
 - **Conversation history:** Start a new chat, list the signed-in user's previous chats, select a chat to continue it, and keep conversation context across turns. History must be isolated by account; the product experience should use backend persistence rather than treating browser storage as the source of truth.
 - **Chat composer:** Send a message with Enter, insert a newline with Shift+Enter, attach files, and select an available model from a dropdown. The UI must provide busy, disabled, error, and retry states where appropriate.
 - **Execution feedback:** Stream assistant output into the active conversation and show meaningful status/activity events, such as thinking, a tool call, a tool result, or a completed response. Do not show fabricated tool activity as if it came from the backend.
-- **Generic HITL (planned):** Render a backend/model-provided input request, collect the user's answer or selected action, and submit a structured response correlated with the paused request/run. The UI must not depend on which model or agent requested the input. This flow is not implemented yet.
+- **Generic HITL:** Render backend-provided input requests, collect typed answers or actions, and submit a structured response correlated with the paused request/run. The UI does not depend on which model or agent requested the input.
 - **Profile:** Show account details and available preferences from the authenticated user/session.
 - **Responsive and accessible interaction:** Support desktop and mobile navigation, collapsible chat history, keyboard use, visible focus, understandable validation/errors, and reduced-motion preferences.
 
@@ -35,12 +35,12 @@ The UI should remain independent of any specific model provider or orchestration
 2. **Start or resume a chat:** The sidebar has a New chat action and selectable chat history. Resuming a chat loads its messages and allows the user to continue that session. Sidebar collapse/expand and mobile navigation must not discard the current draft or conversation.
 3. **Send a message:** The composer supports multiline text, attachments, and model selection. The interface shows the submitted user message, prevents accidental duplicate submissions while a request is active, and indicates errors without silently losing the draft.
 4. **Follow execution:** Display status events and streamed text in order. Tool calls and results should be distinguishable from assistant prose and should not expose secrets or internal data that is not intended for the user. Allow stopping an active generation when the backend supports cancellation.
-5. **Respond to a human-input request (planned):** The generic interaction contract below describes the intended flow. The current API/UI does not accept HITL responses or resume interrupted runs; an agent interrupt is surfaced as a failed run, not a completed answer.
+5. **Respond to a human-input request:** When an agent pauses, the event stream delivers a persisted generic request. The UI renders its fields and actions; submitting a valid response resumes that checkpointed run, while cancellation stops it. Stale, invalid, or non-owned responses are rejected visibly.
 6. **Account controls:** Show profile information and sign out through the backend; signing out must clear the server session and frontend account state.
 
 ## Generic HITL interaction contract
 
-When HITL is implemented, the backend should send a serializable input request as part of the conversation/run event stream. The UI should render the request data, rather than hard-coding agent-specific forms.
+The backend sends a serializable input request as part of the persisted conversation/run event stream. The UI renders the request data rather than hard-coding agent-specific forms. Legacy string interrupts are normalized to a text or yes/no prompt; structured interrupt payloads retain their supplied fields and actions.
 
 Suggested request shape:
 
@@ -84,9 +84,7 @@ The response sent to the backend should preserve the request/run correlation and
 }
 ```
 
-The future backend must validate the request is still pending, validate the submitted action and values, authorize the user against the conversation/run, and resume or cancel the run. The UI should display validation errors from both client-side checks and the backend. Model-specific schemas should be normalized by the backend or an adapter, not embedded in the chat components.
-
-Human-input run resumption is not connected yet. The current chat does not fabricate a HITL prompt or claim to resume a paused run.
+`POST /api/runs/{runId}/human-input` validates that the request is pending, the action and typed field values are allowed, and the signed-in user owns the matching run before resuming or cancelling it. Pending requests and partial output are persisted; the request is correlated in the event stream with its stable request ID. The UI displays client and server validation errors. Unknown field kinds use a JSON input fallback, with server-side JSON validation.
 
 ## Backend/frontend integration requirements
 
@@ -97,7 +95,7 @@ The backend/API layer needs to provide:
 - A list of available models and stable model identifiers accepted by the chat API.
 - A chat/run operation that accepts a conversation ID, model ID, message content, and attachment references, and returns streamed events or a stream that can be adapted into UI events.
 - Events for assistant text deltas, execution status, tool activity/results, HITL requests, completion, cancellation, and errors. Events should include conversation/run/message IDs and sequence/correlation IDs where needed.
-- (Planned) An endpoint/action to submit a HITL response and resume or cancel the corresponding paused run.
+- An endpoint/action to submit a HITL response and resume or cancel the corresponding paused run.
 - Conversation-scoped attachment upload/storage, metadata, size/type limits, indexing status, and access control. The frontend uploads file contents through the approved API and sends returned attachment IDs with chat requests.
 - Clear error responses, authorization checks, rate limits, and cancellation semantics.
 
@@ -110,6 +108,7 @@ Keep API calls and stream parsing in a frontend service/adapter layer, not insid
 - `POST /api/conversations/{id}/attachments` accepts PDF, DOCX, TXT, Markdown, Python, and CSV files up to 10 MB. It validates content, stores the file outside public web paths, associates it with the signed-in owner and conversation, and indexes it immediately. The response contains an attachment ID and `indexingStatus`; failed indexing returns an error and attempts to remove partial upload/index data. If cleanup itself fails, the unavailable upload remains associated with the conversation so conversation deletion can retry cleanup. Indexing requires the configured OpenAI embedding key.
 - `POST /api/conversations/{id}/runs` accepts `modelId`, `content`, and uploaded attachment IDs; it persists the user message and returns a run ID with `202 Accepted`.
 - `GET /api/runs/{runId}/events?afterSequence=N` streams persisted SSE events. Each event has a monotonically increasing per-run `sequence`; clients can reconnect after the last sequence. `POST /api/runs/{runId}/cancel` requests cancellation. Only the owning account can read or cancel a run.
+- `POST /api/runs/{runId}/human-input` accepts `requestId`, `runId`, `actionId`, and typed `values`. Pending requests are persisted, owner/action/field validation is enforced, and accepted responses resume the matching LangGraph checkpoint. A cancel action (or the existing stop control) cancels the paused run.
 - Assistant deltas and sanitized tool activity are persisted before delivery. Final assistant messages are stored on completion; partial messages are marked incomplete on cancellation or failure. A user may have up to three active runs at once.
 
 The SQLite compatibility migration preserves existing unowned conversations. They remain excluded from authenticated lists and cannot be read or assigned to a user through the new API; no ownership is inferred from browser storage. Event replay survives client disconnects; an API process restart does not resume an in-memory agent task.
@@ -119,10 +118,9 @@ The SQLite compatibility migration preserves existing unowned conversations. The
 - The frontend uses the server as the source of truth for conversation history, model choices, file uploads, run state, and streamed events. Local demo replies and browser-local history are no longer used.
 - Google sign-in persists the verified Google subject/profile to SQLite and APIs derive ownership only from the signed server session.
 - Conversation and run APIs are owner-scoped. Legacy unowned rows remain preserved and unavailable to signed-in users unless migrated deliberately by a separate, verified process.
-- Run execution uses the LangGraph agent server-side. Assistant deltas and allowlisted tool names are persisted in sequence before SSE delivery; event replay, cancellation, and partial-message state are implemented. A user is limited to three active runs.
+- Run execution uses the LangGraph agent server-side. Assistant deltas and allowlisted tool names are persisted in sequence before SSE delivery; event replay, cancellation, partial-message state, and generic human-input pause/resumption are implemented. A user is limited to three active runs.
 - Uploaded PDF, DOCX, TXT, Markdown, Python, and CSV attachments are saved with owner-scoped metadata and bounded by a 10 MB upload limit. For RAG execution, OpenAI embeddings require a configured `OPENAI_API_KEY`.
 - `src/app/backend/rag.py` stores embeddings in persistent Chroma at `src/app/backend/data/rag/chroma_db`; ingestion and retrieval are scoped by conversation thread ID. The focused RAG tests mock the vector store.
-- Generic HITL submission/resumption is not yet connected to the chat UI/API. If the existing agent pauses for input, the run must not be treated as a completed answer; see current-state notes for the remaining limitation.
 
 ## Local setup
 
@@ -187,7 +185,7 @@ Run the backend unit tests from `src/app/backend` with the same Python environme
 python -m unittest discover -s tests -v
 ```
 
-The backend suite includes [`tests/test_api.py`](./src/app/backend/tests/test_api.py) for authenticated ownership, legacy unowned history, model validation, attachment upload metadata, event replay, and mocked streamed run persistence; [`tests/test_rag.py`](./src/app/backend/tests/test_rag.py) covers extraction and conversation-scoped indexing with a fake vector store; and [`tests/test_agents.py`](./src/app/backend/tests/test_agents.py) covers agent configuration. These tests do not prove live provider execution with valid Google/OpenAI credentials.
+The backend suite includes [`tests/test_api.py`](./src/app/backend/tests/test_api.py) for authenticated ownership, legacy unowned history, model validation, attachment upload metadata, event replay, mocked streamed run persistence, and human-input persistence/validation/checkpoint resumption; [`tests/test_rag.py`](./src/app/backend/tests/test_rag.py) covers extraction and conversation-scoped indexing with a fake vector store; and [`tests/test_agents.py`](./src/app/backend/tests/test_agents.py) covers agent configuration. These tests do not prove live provider execution with valid Google/OpenAI credentials.
 
 Run frontend checks from `src/app/frontend`:
 
@@ -221,6 +219,6 @@ Run from `src/app/frontend`:
 - [x] Conversation deletion is owner-scoped, confirmed in the UI, stops active runs when possible, and removes conversation messages, runs/events, private files, and RAG chunks.
 - [x] Assistant output streams incrementally with persisted event ordering, status, tool activity, completion, failure, cancellation, and replay; backend behavior is covered by focused mocked/API tests.
 - [ ] Live provider-backed runs and cancellation should be smoke-tested with valid Google OAuth/OpenAI credentials.
-- [ ] Generic HITL request rendering, validation, submission, and run resumption are not implemented.
+- [x] Backend-originated human-input requests are persisted, rendered generically, validated owner-side, and submitted to resume or cancel their matching run.
 - [ ] The UI remains usable on narrow screens, with keyboard navigation, visible focus, and reduced-motion support.
 - [ ] No API keys, OAuth client secrets, or authorization decisions are exposed to or trusted from the frontend.

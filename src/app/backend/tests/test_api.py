@@ -384,7 +384,7 @@ class ConversationApiTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(events[3]["payload"], {"name": "calculator"})
 
-    async def test_agent_interrupt_is_not_reported_as_completed(self):
+    async def test_agent_interrupt_is_persisted_submitted_and_resumed(self):
         conversation = db.create_conversation(
             thread_id="paused-thread",
             user_id="google-owner",
@@ -400,15 +400,38 @@ class ConversationApiTests(unittest.IsolatedAsyncioTestCase):
         )
 
         class PausedAgent:
-            async def astream_events(self, *_args, **_kwargs):
-                if False:
-                    yield {}
+            def __init__(self):
+                self.resumed = False
+
+            async def astream_events(self, run_input, **_kwargs):
+                from langgraph.types import Command
+
+                if isinstance(run_input, Command):
+                    self.resumed = True
+                    self.assert_resume(run_input)
+                    yield {
+                        "event": "on_chat_model_stream",
+                        "data": {"chunk": SimpleNamespace(content="Approved.")},
+                    }
+                else:
+                    if False:
+                        yield {}
+
+            @staticmethod
+            def assert_resume(command):
+                if command.resume != "yes":
+                    raise AssertionError("The approval response was not passed to the checkpoint.")
 
             async def aget_state(self, _config):
-                return SimpleNamespace(tasks=[SimpleNamespace(interrupts=["pending"])])
+                return SimpleNamespace(
+                    tasks=[]
+                    if self.resumed
+                    else [SimpleNamespace(interrupts=["Approve this action? (yes/no)"])]
+                )
 
+        fake_agent = PausedAgent()
         agent_module = ModuleType("agents")
-        agent_module.get_agent = lambda _model_id: PausedAgent()
+        agent_module.get_agent = lambda _model_id: fake_agent
         with patch.dict("sys.modules", {"agents": agent_module}):
             await api_app.execute_run(
                 run.id,
@@ -420,9 +443,197 @@ class ConversationApiTests(unittest.IsolatedAsyncioTestCase):
             )
 
         events = db.get_run_events(run.id)
-        self.assertNotIn("completed", [event["type"] for event in events])
-        self.assertEqual(events[-1]["type"], "error")
-        self.assertEqual(events[-2]["payload"], {"status": "failed"})
+        self.assertEqual(events[-2]["payload"]["status"], "waiting_for_input")
+        self.assertEqual(events[-1]["type"], "human_input_request")
+        self.assertEqual(events[-1]["payload"]["fields"][0]["id"], "decision")
+        self.assertEqual(db.get_owned_run(run.id, "google-owner").status, "waiting_for_input")
+        pending = db.get_owned_human_input_request(
+            events[-1]["payload"]["requestId"],
+            "google-owner",
+        )
+        self.assertEqual(pending.status, "pending")
+
+        self.assertEqual(
+            self.client.post(
+                f"/api/runs/{run.id}/human-input",
+                json={
+                    "requestId": pending.request_id,
+                    "runId": run.id,
+                    "actionId": "invalid-action",
+                    "values": {"decision": "yes"},
+                },
+                headers={"Origin": "http://localhost:5173"},
+            ).status_code,
+            422,
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/runs/{run.id}/human-input",
+                json={
+                    "requestId": pending.request_id,
+                    "runId": run.id,
+                    "actionId": "continue",
+                    "values": {"decision": "maybe"},
+                },
+                headers={"Origin": "http://localhost:5173"},
+            ).status_code,
+            422,
+        )
+
+        api_app.app.dependency_overrides[api_app.authenticated_user] = lambda: {
+            "id": "different-google-user"
+        }
+        self.assertEqual(
+            self.client.post(
+                f"/api/runs/{run.id}/human-input",
+                json={
+                    "requestId": pending.request_id,
+                    "runId": run.id,
+                    "actionId": "continue",
+                    "values": {"decision": "yes"},
+                },
+                headers={"Origin": "http://localhost:5173"},
+            ).status_code,
+            404,
+        )
+        api_app.app.dependency_overrides[api_app.authenticated_user] = lambda: {
+            "id": "google-owner"
+        }
+
+        with patch.dict("sys.modules", {"agents": agent_module}):
+            response = await api_app.submit_human_input(
+                run.id,
+                api_app.HumanInputSubmitRequest(
+                    requestId=pending.request_id,
+                    runId=run.id,
+                    actionId="continue",
+                    values={"decision": "yes"},
+                ),
+                {"id": "google-owner"},
+            )
+            self.assertEqual(response.status, "resuming")
+            await api_app.active_run_tasks[run.id]
+        self.assertTrue(fake_agent.resumed)
+        self.assertEqual(db.get_owned_run(run.id, "google-owner").status, "completed")
+        self.assertEqual(
+            [message.content for message in db.get_chat_history(conversation.thread_id, "google-owner")],
+            ["approve this action", "Approved."],
+        )
+        self.assertEqual(
+            db.get_owned_human_input_request(pending.request_id, "google-owner").status,
+            "responded",
+        )
+        self.assertEqual(
+            self.client.post(
+                f"/api/runs/{run.id}/human-input",
+                json={
+                    "requestId": pending.request_id,
+                    "runId": run.id,
+                    "actionId": "continue",
+                    "values": {"decision": "yes"},
+                },
+                headers={"Origin": "http://localhost:5173"},
+            ).status_code,
+            409,
+        )
+
+    def test_structured_human_input_preserves_typed_values_and_cancel_action(self):
+        request, resume_mode = api_app.normalize_human_input(
+            {
+                "title": "Choose settings",
+                "description": "Select a count and mode.",
+                "fields": [
+                    {
+                        "id": "count",
+                        "label": "Count",
+                        "kind": "number",
+                        "required": True,
+                        "constraints": {"minimum": 1, "maximum": 5},
+                    },
+                    {
+                        "id": "mode",
+                        "label": "Mode",
+                        "kind": "single_choice",
+                        "required": True,
+                        "options": [
+                            {"label": "Fast", "value": "fast"},
+                            {"label": "Careful", "value": "careful"},
+                        ],
+                    },
+                ],
+                "actions": [
+                    {"id": "continue", "label": "Continue"},
+                    {"id": "cancel", "label": "Cancel"},
+                ],
+            },
+            run_id="typed-run",
+        )
+        stored_request = SimpleNamespace(
+            fields=[field.model_dump() for field in request.fields],
+            actions=[action.model_dump() for action in request.actions],
+            resume_mode=resume_mode,
+        )
+
+        cancelled, resume_value = api_app.validate_human_input_values(
+            stored_request,
+            action_id="continue",
+            values={"count": 3, "mode": "fast"},
+        )
+
+        self.assertFalse(cancelled)
+        self.assertEqual(
+            resume_value,
+            {"actionId": "continue", "values": {"count": 3, "mode": "fast"}},
+        )
+        with self.assertRaisesRegex(ValueError, "finite number"):
+            api_app.validate_human_input_values(
+                stored_request,
+                action_id="continue",
+                values={"count": "3", "mode": "fast"},
+            )
+        cancelled, _ = api_app.validate_human_input_values(
+            stored_request,
+            action_id="cancel",
+            values={},
+        )
+        self.assertTrue(cancelled)
+
+    async def test_cancelling_a_paused_run_closes_its_pending_request(self):
+        conversation = db.create_conversation(
+            thread_id="cancel-paused-thread",
+            user_id="google-owner",
+            model_id="gpt-4o-mini",
+        )
+        run, _ = db.create_run_with_user_message(
+            run_id="cancel-paused-run",
+            thread_id=conversation.thread_id,
+            user_id="google-owner",
+            model_id="gpt-4o-mini",
+            content="continue?",
+            attachment_ids=[],
+        )
+        request = db.create_human_input_request(
+            request_id="cancel-paused-request",
+            run_id=run.id,
+            title="Continue?",
+            description=None,
+            fields=[],
+            actions=[{"id": "continue", "label": "Continue"}],
+            resume_mode="mapping",
+        )
+
+        response = self.client.post(
+            f"/api/runs/{run.id}/cancel",
+            headers={"Origin": "http://localhost:5173"},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(db.get_owned_run(run.id, "google-owner").status, "cancelled")
+        self.assertEqual(
+            db.get_owned_human_input_request(request.request_id, "google-owner").status,
+            "cancelled",
+        )
+        self.assertEqual(db.get_run_events(run.id)[-1]["type"], "cancelled")
 
 
 if __name__ == "__main__":

@@ -122,6 +122,7 @@ class ChatRun(Base):
     model_id = Column(String, nullable=False)
     status = Column(String, nullable=False, default="queued", index=True)
     error = Column(Text)
+    partial_text = Column(Text, nullable=False, default="")
     cancellation_requested = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     started_at = Column(DateTime)
@@ -199,6 +200,7 @@ class HumanInputRequest(Base):
     description = Column(Text)
     fields = Column(JSON, nullable=False, default=list)
     actions = Column(JSON, nullable=False, default=list)
+    resume_mode = Column(String, nullable=False, default="mapping")
     status = Column(String, nullable=False, default="pending", index=True)
     action_id = Column(String)
     response_values = Column(JSON)
@@ -236,6 +238,12 @@ def _migrate_legacy_columns() -> None:
         "attachments": {
             "indexing_status": "VARCHAR NOT NULL DEFAULT 'indexed'",
             "indexing_error": "TEXT",
+        },
+        "human_input_requests": {
+            "resume_mode": "VARCHAR NOT NULL DEFAULT 'mapping'",
+        },
+        "chat_runs": {
+            "partial_text": "TEXT NOT NULL DEFAULT ''",
         },
     }
 
@@ -605,6 +613,20 @@ def request_run_cancellation(run_id: str, user_id: str) -> ChatRun:
             raise ValueError("Run does not exist or is not owned by this user.")
         if run.status in {"queued", "running", "waiting_for_input"}:
             run.cancellation_requested = True
+            (
+                db.query(HumanInputRequest)
+                .filter(
+                    HumanInputRequest.run_id == run_id,
+                    HumanInputRequest.status == "pending",
+                )
+                .update(
+                    {
+                        HumanInputRequest.status: "cancelled",
+                        HumanInputRequest.resolved_at: datetime.utcnow(),
+                    },
+                    synchronize_session=False,
+                )
+            )
             db.commit()
             db.refresh(run)
         db.expunge(run)
@@ -700,6 +722,163 @@ def get_run_events(run_id: str, after_sequence: int = -1) -> list[dict[str, Any]
             }
             for event in events
         ]
+    finally:
+        db.close()
+
+
+def create_human_input_request(
+    *,
+    request_id: str,
+    run_id: str,
+    title: str,
+    description: str | None,
+    fields: list[dict[str, Any]],
+    actions: list[dict[str, str]],
+    resume_mode: str,
+) -> HumanInputRequest:
+    if resume_mode not in {"mapping", "string"}:
+        raise ValueError("Unsupported human-input resume mode.")
+    db = SessionLocal()
+    try:
+        run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None or run.status not in {"queued", "running"}:
+            raise ValueError("The run is not able to accept a human-input request.")
+        pending = (
+            db.query(HumanInputRequest.request_id)
+            .filter(
+                HumanInputRequest.run_id == run_id,
+                HumanInputRequest.status == "pending",
+            )
+            .first()
+        )
+        if pending is not None:
+            raise ValueError("The run already has a pending human-input request.")
+        request = HumanInputRequest(
+            request_id=request_id,
+            run_id=run_id,
+            thread_id=run.thread_id,
+            title=title,
+            description=description,
+            fields=fields,
+            actions=actions,
+            resume_mode=resume_mode,
+            status="pending",
+        )
+        run.status = "waiting_for_input"
+        db.add(request)
+        db.commit()
+        db.refresh(request)
+        db.expunge(request)
+        return request
+    finally:
+        db.close()
+
+
+def get_owned_human_input_request(
+    request_id: str,
+    user_id: str,
+) -> HumanInputRequest:
+    db = SessionLocal()
+    try:
+        request = (
+            db.query(HumanInputRequest)
+            .join(ChatRun, ChatRun.id == HumanInputRequest.run_id)
+            .join(Conversation, Conversation.thread_id == ChatRun.thread_id)
+            .filter(
+                HumanInputRequest.request_id == request_id,
+                Conversation.user_id == user_id,
+            )
+            .first()
+        )
+        if request is None:
+            raise ValueError("Human-input request does not exist or is not owned by this user.")
+        db.expunge(request)
+        return request
+    finally:
+        db.close()
+
+
+def resolve_human_input_request(
+    *,
+    request_id: str,
+    run_id: str,
+    user_id: str,
+    action_id: str,
+    values: dict[str, Any],
+    cancelled: bool,
+) -> HumanInputRequest:
+    db = SessionLocal()
+    try:
+        request = (
+            db.query(HumanInputRequest)
+            .join(ChatRun, ChatRun.id == HumanInputRequest.run_id)
+            .join(Conversation, Conversation.thread_id == ChatRun.thread_id)
+            .filter(
+                HumanInputRequest.request_id == request_id,
+                HumanInputRequest.run_id == run_id,
+                HumanInputRequest.status == "pending",
+                ChatRun.status == "waiting_for_input",
+                Conversation.user_id == user_id,
+            )
+            .first()
+        )
+        if request is None:
+            raise ValueError("Human-input request is no longer pending or is not owned by this user.")
+        request.status = "cancelled" if cancelled else "responded"
+        request.action_id = action_id
+        request.response_values = values
+        request.resolved_at = datetime.utcnow()
+        if cancelled:
+            request.run.cancellation_requested = True
+        db.commit()
+        db.refresh(request)
+        db.expunge(request)
+        return request
+    finally:
+        db.close()
+
+
+def get_run_assistant_content(run_id: str) -> str:
+    db = SessionLocal()
+    try:
+        run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None:
+            raise ValueError("Run does not exist.")
+        return run.partial_text
+    finally:
+        db.close()
+
+
+def save_run_partial_text(run_id: str, content: str) -> None:
+    db = SessionLocal()
+    try:
+        run = db.query(ChatRun).filter(ChatRun.id == run_id).first()
+        if run is None:
+            raise ValueError("Run does not exist.")
+        run.partial_text = content
+        db.commit()
+    finally:
+        db.close()
+
+
+def close_pending_human_input_requests(run_id: str) -> None:
+    db = SessionLocal()
+    try:
+        (
+            db.query(HumanInputRequest)
+            .filter(
+                HumanInputRequest.run_id == run_id,
+                HumanInputRequest.status == "pending",
+            )
+            .update(
+                {
+                    HumanInputRequest.status: "cancelled",
+                    HumanInputRequest.resolved_at: datetime.utcnow(),
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
     finally:
         db.close()
 

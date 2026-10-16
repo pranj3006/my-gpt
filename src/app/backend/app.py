@@ -2,12 +2,15 @@ import asyncio
 from io import BytesIO
 import json
 import logging
+import math
 import os
+import re
 import secrets
 import uuid
 import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date, datetime, time
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlencode
 
@@ -30,6 +33,12 @@ from schemas import (
     ConversationCreateRequest,
     ConversationResponse,
     ConversationSummary,
+    HumanInputAction,
+    HumanInputField,
+    HumanInputOption,
+    HumanInputRequest,
+    HumanInputSubmitRequest,
+    HumanInputSubmitResult,
     ModelOption,
     RunSummary,
     UserProfile,
@@ -107,10 +116,6 @@ MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 ALLOWED_UPLOAD_EXTENSIONS = {".pdf", ".docx", ".txt", ".md", ".py", ".csv"}
 active_run_tasks: dict[str, asyncio.Task[None]] = {}
 conversation_locks: dict[str, asyncio.Lock] = {}
-
-
-class UnsupportedHumanInput(RuntimeError):
-    pass
 
 
 def get_conversation_lock(thread_id: str) -> asyncio.Lock:
@@ -619,6 +624,223 @@ async def upload_attachment(
         return await _upload_attachment(thread_id, file, user)
 
 
+def normalize_human_input(
+    interrupt_value: object,
+    *,
+    run_id: str,
+) -> tuple[HumanInputRequest, str]:
+    request_id = str(uuid.uuid4())
+    if isinstance(interrupt_value, dict) and "fields" in interrupt_value:
+        raw_fields = interrupt_value["fields"]
+        raw_actions = interrupt_value.get("actions", [{"id": "continue", "label": "Continue"}])
+        if not isinstance(raw_fields, list) or len(raw_fields) > 40:
+            raise ValueError("The agent produced an invalid human-input field list.")
+        if not isinstance(raw_actions, list) or not raw_actions or len(raw_actions) > 20:
+            raise ValueError("The agent produced an invalid human-input action list.")
+        fields = [HumanInputField.model_validate(field) for field in raw_fields]
+        actions = [HumanInputAction.model_validate(action) for action in raw_actions]
+        if len({field.id for field in fields}) != len(fields):
+            raise ValueError("The agent produced duplicate human-input field IDs.")
+        if len({action.id for action in actions}) != len(actions):
+            raise ValueError("The agent produced duplicate human-input action IDs.")
+        title = interrupt_value.get("title", "Additional information required")
+        description = interrupt_value.get("description")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError("The agent produced an invalid human-input title.")
+        if description is not None and not isinstance(description, str):
+            raise ValueError("The agent produced an invalid human-input description.")
+        return (
+            HumanInputRequest(
+                requestId=request_id,
+                runId=run_id,
+                title=title.strip()[:200],
+                description=description,
+                fields=fields,
+                actions=actions,
+            ),
+            "mapping",
+        )
+
+    if isinstance(interrupt_value, str):
+        prompt = interrupt_value.strip()
+    elif isinstance(interrupt_value, dict):
+        prompt_value = next(
+            (
+                interrupt_value[key]
+                for key in ("description", "question", "prompt", "message")
+                if isinstance(interrupt_value.get(key), str)
+            ),
+            None,
+        )
+        prompt = prompt_value.strip() if prompt_value else ""
+    else:
+        prompt = ""
+    if not prompt:
+        raise ValueError("The agent produced an unsupported human-input request.")
+
+    if re.search(r"\byes\s*(?:/|or)\s*no\b", prompt, flags=re.IGNORECASE):
+        fields = [
+            HumanInputField(
+                id="decision",
+                label="Your decision",
+                kind="single_choice",
+                required=True,
+                options=[
+                    HumanInputOption(label="Yes", value="yes"),
+                    HumanInputOption(label="No", value="no"),
+                ],
+            )
+        ]
+    else:
+        fields = [
+            HumanInputField(
+                id="answer",
+                label="Your response",
+                kind="textarea",
+                required=True,
+            )
+        ]
+    return (
+        HumanInputRequest(
+            requestId=request_id,
+            runId=run_id,
+            title="Agent input required",
+            description=prompt[:4000],
+            fields=fields,
+            actions=[HumanInputAction(id="continue", label="Continue")],
+        ),
+        "string",
+    )
+
+
+def is_cancel_action(action: HumanInputAction) -> bool:
+    return action.id.strip().lower() in {"cancel", "stop", "abort"} or action.label.strip().lower().startswith(
+        ("cancel", "stop")
+    )
+
+
+def validate_human_input_values(
+    request: db.HumanInputRequest,
+    *,
+    action_id: str,
+    values: dict[str, object],
+) -> tuple[bool, object]:
+    actions = [HumanInputAction.model_validate(action) for action in request.actions]
+    action = next((item for item in actions if item.id == action_id), None)
+    if action is None:
+        raise ValueError("Choose one of the available actions.")
+    cancelled = is_cancel_action(action)
+    if cancelled:
+        return True, {}
+    try:
+        serialized_values = json.dumps(values, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError("The human-input response must contain JSON values.") from error
+    if len(serialized_values) > 64_000:
+        raise ValueError("The human-input response is too large.")
+    fields = [HumanInputField.model_validate(field) for field in request.fields]
+    field_ids = {field.id for field in fields}
+    unknown_ids = set(values) - field_ids
+    if unknown_ids:
+        raise ValueError("The response contains an unknown field.")
+
+    validated_values: dict[str, object] = {}
+    for field in fields:
+        present = field.id in values
+        value = values.get(field.id)
+        if not present or value is None or value == "":
+            if field.required:
+                raise ValueError(f"{field.label} is required.")
+            continue
+
+        kind = field.kind.strip().lower().replace("-", "_")
+        constraints = field.constraints
+        options = {option.value for option in field.options}
+        if kind in {"text", "textarea"}:
+            if not isinstance(value, str):
+                raise ValueError(f"{field.label} must be text.")
+            if field.required and not value.strip():
+                raise ValueError(f"{field.label} is required.")
+            min_length = constraints.get("minLength", constraints.get("min_length"))
+            max_length = constraints.get("maxLength", constraints.get("max_length"))
+            if isinstance(min_length, int) and len(value) < min_length:
+                raise ValueError(f"{field.label} is too short.")
+            if isinstance(max_length, int) and len(value) > max_length:
+                raise ValueError(f"{field.label} is too long.")
+            pattern = constraints.get("pattern")
+            if pattern is not None:
+                if not isinstance(pattern, str):
+                    raise ValueError(f"{field.label} has invalid validation rules.")
+                try:
+                    matches = re.search(pattern, value)
+                except re.error as error:
+                    raise ValueError(f"{field.label} has invalid validation rules.") from error
+                if matches is None:
+                    raise ValueError(f"{field.label} has an invalid format.")
+        elif kind == "number":
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{field.label} must be a finite number.")
+            minimum = constraints.get("minimum", constraints.get("min"))
+            maximum = constraints.get("maximum", constraints.get("max"))
+            if isinstance(minimum, (int, float)) and value < minimum:
+                raise ValueError(f"{field.label} is below the minimum.")
+            if isinstance(maximum, (int, float)) and value > maximum:
+                raise ValueError(f"{field.label} is above the maximum.")
+        elif kind == "boolean":
+            if not isinstance(value, bool):
+                raise ValueError(f"{field.label} must be true or false.")
+        elif kind in {"single_choice", "select"}:
+            if not isinstance(value, str):
+                raise ValueError(f"Choose a valid option for {field.label}.")
+            if field.options and value not in options:
+                raise ValueError(f"Choose a valid option for {field.label}.")
+        elif kind in {"multi_select", "multiselect"}:
+            if (
+                not isinstance(value, list)
+                or any(not isinstance(option, str) for option in value)
+                or len(set(value)) != len(value)
+                or (field.options and any(option not in options for option in value))
+            ):
+                raise ValueError(f"Choose valid options for {field.label}.")
+        elif kind == "date":
+            if not isinstance(value, str):
+                raise ValueError(f"{field.label} must be a date.")
+            try:
+                date.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(f"{field.label} must be a valid date.") from error
+        elif kind == "time":
+            if not isinstance(value, str):
+                raise ValueError(f"{field.label} must be a time.")
+            try:
+                time.fromisoformat(value)
+            except ValueError as error:
+                raise ValueError(f"{field.label} must be a valid time.") from error
+        elif kind in {"datetime", "datetime_local"}:
+            if not isinstance(value, str):
+                raise ValueError(f"{field.label} must be a date and time.")
+            try:
+                datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError(f"{field.label} must be a valid date and time.") from error
+        else:
+            try:
+                json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"{field.label} must contain valid JSON data.") from error
+        validated_values[field.id] = value
+
+    if request.resume_mode == "string":
+        if len(validated_values) != 1:
+            raise ValueError("The agent's response must contain exactly one answer.")
+        resume_value = next(iter(validated_values.values()))
+        if not isinstance(resume_value, str):
+            raise ValueError("The agent's response must be text.")
+    else:
+        resume_value = {"actionId": action_id, "values": validated_values}
+    return cancelled, resume_value
+
+
 async def execute_run(
     run_id: str,
     thread_id: str,
@@ -626,14 +848,19 @@ async def execute_run(
     model_id: str,
     content: str,
     attachment_ids: list[str],
+    resume_value: object | None = None,
 ) -> None:
     accumulated_text = ""
     try:
+        if resume_value is not None:
+            accumulated_text = db.get_run_assistant_content(run_id)
         db.append_run_event(
             run_id=run_id,
             event_type="status",
             payload={"status": "running"},
         )
+        if db.run_cancellation_requested(run_id):
+            raise asyncio.CancelledError
         attachments = db.get_owned_attachments(attachment_ids, user_id)
         if any(
             attachment.thread_id != thread_id or attachment.indexing_status != "indexed"
@@ -650,6 +877,7 @@ async def execute_run(
 
         from agents import get_agent
         from langchain_core.messages import HumanMessage
+        from langgraph.types import Command
 
         agent = get_agent(model_id)
         config = {
@@ -658,8 +886,13 @@ async def execute_run(
                 "user_id": user_id,
             }
         }
+        run_input = (
+            Command(resume=resume_value)
+            if resume_value is not None
+            else {"messages": [HumanMessage(content=prompt)]}
+        )
         async for event in agent.astream_events(
-            {"messages": [HumanMessage(content=prompt)]},
+            run_input,
             config=config,
             version="v2",
         ):
@@ -700,9 +933,44 @@ async def execute_run(
                     payload={"name": str(event.get("name") or "Tool")[:80]},
                 )
 
+        if db.run_cancellation_requested(run_id):
+            raise asyncio.CancelledError
         snapshot = await agent.aget_state(config)
-        if any(task.interrupts for task in snapshot.tasks):
-            raise UnsupportedHumanInput("This agent run is waiting for human input.")
+        interrupts = [
+            interrupt
+            for task in snapshot.tasks
+            for interrupt in task.interrupts
+        ]
+        if interrupts:
+            if len(interrupts) != 1:
+                raise ValueError("The agent requested multiple inputs at the same time.")
+            interrupt_value = getattr(interrupts[0], "value", interrupts[0])
+            input_request, resume_mode = normalize_human_input(
+                interrupt_value,
+                run_id=run_id,
+            )
+            db.create_human_input_request(
+                request_id=input_request.request_id,
+                run_id=run_id,
+                title=input_request.title,
+                description=input_request.description,
+                fields=[field.model_dump() for field in input_request.fields],
+                actions=[action.model_dump() for action in input_request.actions],
+                resume_mode=resume_mode,
+            )
+            db.save_run_partial_text(run_id, accumulated_text)
+            db.append_run_event(
+                run_id=run_id,
+                event_type="status",
+                payload={"status": "waiting_for_input"},
+            )
+            db.append_run_event(
+                run_id=run_id,
+                event_type="human_input_request",
+                payload=input_request.model_dump(by_alias=True),
+                correlation_id=input_request.request_id,
+            )
+            return
 
         assistant_id = None
         if accumulated_text:
@@ -726,6 +994,7 @@ async def execute_run(
             message_id=assistant_id,
         )
     except asyncio.CancelledError:
+        db.close_pending_human_input_requests(run_id)
         if accumulated_text:
             db.save_assistant_message(
                 thread_id=thread_id,
@@ -738,27 +1007,9 @@ async def execute_run(
         if db.get_owned_run(run_id, user_id).status != "cancelled":
             db.append_run_event(run_id=run_id, event_type="status", payload={"status": "cancelled"})
             db.append_run_event(run_id=run_id, event_type="cancelled", payload={})
-    except UnsupportedHumanInput:
-        logger.warning("Chat run %s paused for unsupported human input.", run_id)
-        if accumulated_text:
-            db.save_assistant_message(
-                thread_id=thread_id,
-                user_id=user_id,
-                run_id=run_id,
-                model_id=model_id,
-                content=accumulated_text,
-                incomplete=True,
-            )
-        db.append_run_event(run_id=run_id, event_type="status", payload={"status": "failed"})
-        db.append_run_event(
-            run_id=run_id,
-            event_type="error",
-            payload={
-                "message": "This response needs human input, which is not available in the app yet."
-            },
-        )
     except Exception:
         logger.exception("Chat run %s failed.", run_id)
+        db.close_pending_human_input_requests(run_id)
         if accumulated_text:
             db.save_assistant_message(
                 thread_id=thread_id,
@@ -888,6 +1139,106 @@ async def stream_run_events(
 
 
 @app.post(
+    "/api/runs/{run_id}/human-input",
+    response_model=HumanInputSubmitResult,
+    status_code=202,
+    dependencies=[Depends(require_trusted_origin)],
+)
+async def submit_human_input(
+    run_id: str,
+    payload: HumanInputSubmitRequest,
+    user: dict[str, str] = Depends(authenticated_user),
+):
+    if payload.run_id != run_id:
+        raise HTTPException(status_code=422, detail="The response runId does not match the request URL.")
+    try:
+        initial_request = db.get_owned_human_input_request(payload.request_id, user["id"])
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    if initial_request.run_id != run_id:
+        raise HTTPException(status_code=404, detail="Human-input request does not belong to this run.")
+
+    async with get_conversation_lock(initial_request.thread_id):
+        task = active_run_tasks.get(run_id)
+        if task is not None and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except asyncio.TimeoutError as error:
+                raise HTTPException(
+                    status_code=409,
+                    detail="The run is still saving its paused state. Please retry your response.",
+                ) from error
+        try:
+            pending_request = db.get_owned_human_input_request(payload.request_id, user["id"])
+        except ValueError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        if pending_request.run_id != run_id:
+            raise HTTPException(status_code=404, detail="Human-input request does not belong to this run.")
+        if pending_request.status != "pending":
+            raise HTTPException(status_code=409, detail="This human-input request is no longer pending.")
+        try:
+            cancelled, resume_value = validate_human_input_values(
+                pending_request,
+                action_id=payload.action_id,
+                values=payload.values,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        try:
+            db.resolve_human_input_request(
+                request_id=payload.request_id,
+                run_id=run_id,
+                user_id=user["id"],
+                action_id=payload.action_id,
+                values={} if cancelled else payload.values,
+                cancelled=cancelled,
+            )
+            run = db.get_owned_run(run_id, user["id"])
+        except ValueError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+
+        if cancelled:
+            task = active_run_tasks.get(run_id)
+            if task is not None and not task.done():
+                task.cancel()
+            else:
+                partial = db.get_run_assistant_content(run_id)
+                if partial:
+                    db.save_assistant_message(
+                        thread_id=run.thread_id,
+                        user_id=user["id"],
+                        run_id=run_id,
+                        model_id=run.model_id,
+                        content=partial,
+                        incomplete=True,
+                    )
+                db.append_run_event(run_id=run_id, event_type="status", payload={"status": "cancelled"})
+                db.append_run_event(run_id=run_id, event_type="cancelled", payload={})
+            return HumanInputSubmitResult(
+                requestId=payload.request_id,
+                runId=run_id,
+                status="cancelled",
+            )
+
+        active_run_tasks[run_id] = asyncio.create_task(
+            execute_run(
+                run_id,
+                run.thread_id,
+                user["id"],
+                run.model_id,
+                "",
+                [],
+                resume_value,
+            )
+        )
+        return HumanInputSubmitResult(
+            requestId=payload.request_id,
+            runId=run_id,
+            status="resuming",
+        )
+
+
+@app.post(
     "/api/runs/{run_id}/cancel",
     status_code=202,
     dependencies=[Depends(require_trusted_origin)],
@@ -903,6 +1254,16 @@ async def cancel_chat_run(
     task = active_run_tasks.get(run_id)
     if run.status in {"queued", "running", "waiting_for_input"} and run.cancellation_requested:
         if task is None or task.done():
+            partial = db.get_run_assistant_content(run_id)
+            if partial:
+                db.save_assistant_message(
+                    thread_id=run.thread_id,
+                    user_id=user["id"],
+                    run_id=run_id,
+                    model_id=run.model_id,
+                    content=partial,
+                    incomplete=True,
+                )
             db.append_run_event(
                 run_id=run_id,
                 event_type="status",

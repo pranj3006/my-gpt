@@ -2,6 +2,7 @@ import type {
   AttachmentRef,
   ChatMessage,
   ConversationSummary,
+  HumanInputSubmission,
   ModelOption,
   RunEvent,
   RunSummary,
@@ -94,6 +95,15 @@ export const api = {
     request<{ runId: string; status: string }>(`/api/runs/${encodeURIComponent(runId)}/cancel`, {
       method: "POST",
     }),
+  submitHumanInput: (submission: HumanInputSubmission) =>
+    request<{ requestId: string; runId: string; status: "resuming" | "cancelled" }>(
+      `/api/runs/${encodeURIComponent(submission.runId)}/human-input`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(submission),
+      },
+    ),
 };
 
 function delay(milliseconds: number, signal: AbortSignal): Promise<void> {

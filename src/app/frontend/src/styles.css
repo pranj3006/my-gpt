@@ -166,6 +166,8 @@ button:focus-visible, textarea:focus-visible, input:focus-visible { outline: 2px
 .human-submit:hover { transform: translateY(-1px); border-color: rgba(255,255,255,.2); background: rgba(255,255,255,.04); }
 .human-submit.primary { border-color: rgba(228,185,137,.2); background: #dfbd98; color: #211c17; font-weight: 600; }
 .human-submit.primary:hover { background: #efcda8; }
+.human-submit:disabled { opacity: .55; cursor: not-allowed; transform: none; }
+.human-json-input { font-family: ui-monospace, SFMono-Regular, Menlo, monospace !important; }
 .human-input-complete { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: #a3ba91; font-size: 10px; }
 .human-response-summary { display: grid; gap: 7px; min-width: min(270px, 72vw); padding: 2px 0; }
 .human-response-heading { display: flex; align-items: center; gap: 7px; color: #d2bd9f; font-size: 10px; }

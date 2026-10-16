@@ -1,6 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import type { ChangeEvent, FormEvent, KeyboardEvent } from "react";
-import type { AttachmentRef, ChatMessage, ModelOption, RunEvent, RunStatus, UserProfile } from "./models";
+import type {
+  AttachmentRef,
+  ChatMessage,
+  HumanInputField,
+  HumanInputRequest,
+  HumanInputSubmission,
+  ModelOption,
+  RunEvent,
+  RunStatus,
+  UserProfile,
+} from "./models";
 import { api, streamRunEvents } from "./api";
 import {
   ArrowLeft,
@@ -36,6 +46,7 @@ type Chat = {
   runId?: string;
   runStatus?: RunStatus;
   runActivity?: string;
+  pendingHumanInput?: HumanInputRequest;
 };
 
 type PendingAttachment = {
@@ -63,6 +74,18 @@ function fromSummary(summary: { id: string; title: string; updatedAt: string }):
     updatedAt: new Date(summary.updatedAt).getTime(),
     messages: [],
   };
+}
+
+function isHumanInputRequest(value: unknown): value is HumanInputRequest {
+  if (typeof value !== "object" || value === null) return false;
+  const request = value as Record<string, unknown>;
+  return (
+    typeof request.requestId === "string"
+    && typeof request.runId === "string"
+    && typeof request.title === "string"
+    && Array.isArray(request.fields)
+    && Array.isArray(request.actions)
+  );
 }
 
 function App() {
@@ -217,7 +240,16 @@ function App() {
       let runStatus = chat.runStatus;
       if (event.type === "status" && event.payload.status) {
         runStatus = event.payload.status;
-        runActivity = event.payload.status === "queued" ? "Waiting to start" : "Working…";
+        runActivity = event.payload.status === "queued"
+          ? "Waiting to start"
+          : event.payload.status === "waiting_for_input"
+            ? "Waiting for your input"
+            : activeStatuses.includes(event.payload.status)
+              ? "Working…"
+              : "";
+        if (event.payload.status !== "waiting_for_input") {
+          chat = { ...chat, pendingHumanInput: undefined };
+        }
       } else if (event.type === "assistant_delta" && typeof event.payload.delta === "string") {
         const streamMessageId = `stream-${event.runId}`;
         const existing = messages.find((message) => message.id === streamMessageId);
@@ -229,6 +261,10 @@ function App() {
             )
           : [...messages, { id: streamMessageId, role: "assistant", content: event.payload.delta }];
         runActivity = "";
+      } else if (event.type === "human_input_request" && isHumanInputRequest(event.payload)) {
+        chat = { ...chat, pendingHumanInput: event.payload };
+        runStatus = "waiting_for_input";
+        runActivity = "";
       } else if (event.type === "tool_call") {
         runActivity = `Using ${typeof event.payload.name === "string" ? event.payload.name : "a tool"}`;
       } else if (event.type === "tool_result") {
@@ -236,12 +272,15 @@ function App() {
       } else if (event.type === "completed") {
         runStatus = "completed";
         runActivity = "";
+        chat = { ...chat, pendingHumanInput: undefined };
       } else if (event.type === "cancelled") {
         runStatus = "cancelled";
         runActivity = "";
+        chat = { ...chat, pendingHumanInput: undefined };
       } else if (event.type === "error") {
         runStatus = "failed";
         runActivity = "";
+        chat = { ...chat, pendingHumanInput: undefined };
         if (typeof event.payload.message === "string") showNotice(event.payload.message);
       }
       return { ...chat, messages, runStatus, runActivity, updatedAt: Date.now() };
@@ -332,6 +371,16 @@ function App() {
       console.error("Unable to cancel run.", error);
       showNotice(error instanceof Error ? error.message : "Couldn't stop this response.");
     }
+  }
+
+  async function respondToHumanInput(chatId: string, submission: HumanInputSubmission) {
+    const response = await api.submitHumanInput(submission);
+    updateChat(chatId, (chat) => ({
+      ...chat,
+      pendingHumanInput: undefined,
+      runStatus: response.status === "cancelled" ? "cancelled" : "running",
+      runActivity: response.status === "cancelled" ? "" : "Working…",
+    }));
   }
 
   async function sendMessage(event?: FormEvent) {
@@ -617,7 +666,19 @@ function App() {
                       </div>
                     </article>
                   ))}
-                  {isGenerating && <article className="message message-assistant"><div className="assistant-mark"><Sparkles size={15} /></div><div className="message-body"><div className="thinking-row"><span className="thinking-dot" /><span>{activeChat?.runActivity || "Working…"}</span></div></div></article>}
+                  {activeChat?.pendingHumanInput && activeChat.runId && (
+                    <article className="message message-assistant">
+                      <div className="assistant-mark"><Sparkles size={15} /></div>
+                      <div className="message-body">
+                        <HumanInputCard
+                          request={activeChat.pendingHumanInput}
+                          disabled={activeChat.runStatus !== "waiting_for_input"}
+                          onSubmit={(submission) => respondToHumanInput(activeChat.id, submission)}
+                        />
+                      </div>
+                    </article>
+                  )}
+                  {isGenerating && activeChat?.runStatus !== "waiting_for_input" && <article className="message message-assistant"><div className="assistant-mark"><Sparkles size={15} /></div><div className="message-body"><div className="thinking-row"><span className="thinking-dot" /><span>{activeChat?.runActivity || "Working…"}</span></div></div></article>}
                   {(activeChat?.runStatus === "failed" || activeChat?.runStatus === "cancelled") && <p className="run-result-status" role="status">{activeChat.runStatus === "failed" ? "The response did not complete. You can try again." : "The response was stopped."}</p>}
                   <div className="messages-bottom" />
                 </div>
@@ -677,6 +738,295 @@ function App() {
         </div>
       )}
     </main>
+  );
+}
+
+function HumanInputCard({
+  request,
+  disabled,
+  onSubmit,
+}: {
+  request: HumanInputRequest;
+  disabled: boolean;
+  onSubmit: (submission: HumanInputSubmission) => Promise<void>;
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [formError, setFormError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  function updateValue(fieldId: string, value: unknown) {
+    setValues((current) => ({ ...current, [fieldId]: value }));
+    setErrors((current) => ({ ...current, [fieldId]: "" }));
+    setFormError("");
+  }
+
+  async function submit(actionId: string) {
+    if (disabled || submitting) return;
+    const nextValues: Record<string, unknown> = {};
+    const nextErrors: Record<string, string> = {};
+    const action = request.actions.find((item) => item.id === actionId);
+    const cancels = action !== undefined
+      && (
+        ["cancel", "stop", "abort"].includes(action.id.trim().toLowerCase())
+        || /^(cancel|stop)\b/i.test(action.label.trim())
+      );
+    for (const field of cancels ? [] : request.fields) {
+      const kind = field.kind.trim().toLowerCase().replaceAll("-", "_");
+      const raw = values[field.id];
+      const empty = raw === undefined
+        || raw === null
+        || raw === ""
+        || (Array.isArray(raw) && raw.length === 0);
+      if (empty) {
+        if (field.required) nextErrors[field.id] = `${field.label} is required.`;
+        continue;
+      }
+
+      if (kind === "number") {
+        const number = typeof raw === "number" ? raw : Number(raw);
+        if (!Number.isFinite(number)) nextErrors[field.id] = `${field.label} must be a number.`;
+        else nextValues[field.id] = number;
+      } else if (kind === "json" || (kind === "multi_select" || kind === "multiselect") && !(field.options?.length)
+        || ![
+        "text", "textarea", "date", "time", "datetime", "datetime_local",
+        "boolean", "single_choice", "select", "multi_select", "multiselect",
+      ].includes(kind)) {
+        if (typeof raw !== "string") nextValues[field.id] = raw;
+        else {
+          try {
+            nextValues[field.id] = JSON.parse(raw) as unknown;
+          } catch {
+            nextErrors[field.id] = `${field.label} must be valid JSON.`;
+          }
+        }
+      } else {
+        if (field.required && typeof raw === "string" && !raw.trim()) {
+          nextErrors[field.id] = `${field.label} is required.`;
+        } else {
+          nextValues[field.id] = raw;
+        }
+      }
+    }
+    if (Object.keys(nextErrors).length) {
+      setErrors(nextErrors);
+      return;
+    }
+
+    setSubmitting(true);
+    setErrors({});
+    setFormError("");
+    try {
+      await onSubmit({
+        requestId: request.requestId,
+        runId: request.runId,
+        actionId,
+        values: nextValues,
+      });
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : "Your response could not be submitted.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  function renderField(field: HumanInputField) {
+    const id = `human-${request.requestId}-${field.id}`;
+    const kind = field.kind.trim().toLowerCase().replaceAll("-", "_");
+    const constraints = field.constraints ?? {};
+    const options = field.options ?? [];
+    const common = {
+      id,
+      disabled: disabled || submitting,
+      required: field.required,
+      placeholder: field.placeholder,
+      "aria-describedby": errors[field.id] ? `${id}-error` : undefined,
+      "aria-invalid": errors[field.id] ? true : undefined,
+    };
+    const textValue = typeof values[field.id] === "string" ? values[field.id] as string : "";
+
+    if (kind === "boolean") {
+      return (
+        <label className="human-boolean" htmlFor={id}>
+          <input
+            {...common}
+            id={id}
+            type="checkbox"
+            checked={typeof values[field.id] === "boolean" ? values[field.id] as boolean : false}
+            onChange={(event) => updateValue(field.id, event.target.checked)}
+          />
+          <span>{field.placeholder || "Yes"}</span>
+        </label>
+      );
+    }
+    if (kind === "single_choice" && options.length > 0) {
+      return (
+        <div id={id} className="human-choice-list" role="radiogroup" aria-labelledby={`${id}-label`}>
+          {options.map((option) => (
+            <label
+              className={`human-choice ${values[field.id] === option.value ? "selected" : ""}`}
+              key={option.value}
+            >
+              <input
+                type="radio"
+                name={id}
+                value={option.value}
+                checked={values[field.id] === option.value}
+                disabled={disabled || submitting}
+                onChange={() => updateValue(field.id, option.value)}
+              />
+              <span>{option.label}</span>
+            </label>
+          ))}
+        </div>
+      );
+    }
+    if ((kind === "multi_select" || kind === "multiselect") && options.length > 0) {
+      const selected = Array.isArray(values[field.id]) ? values[field.id] as string[] : [];
+      return (
+        <div id={id} className="human-choice-list" role="group" aria-labelledby={`${id}-label`}>
+          {options.map((option) => (
+            <label
+              className={`human-choice ${selected.includes(option.value) ? "selected" : ""}`}
+              key={option.value}
+            >
+              <input
+                type="checkbox"
+                value={option.value}
+                checked={selected.includes(option.value)}
+                disabled={disabled || submitting}
+                onChange={(event) => updateValue(
+                  field.id,
+                  event.target.checked
+                    ? [...selected, option.value]
+                    : selected.filter((value) => value !== option.value),
+                )}
+              />
+              <span>{option.label}</span>
+            </label>
+          ))}
+        </div>
+      );
+    }
+    if (kind === "select" && options.length > 0) {
+      return (
+        <select
+          {...common}
+          value={textValue}
+          onChange={(event) => updateValue(field.id, event.target.value)}
+        >
+          <option value="">Choose an option</option>
+          {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+      );
+    }
+    if (kind === "textarea") {
+      return (
+        <textarea
+          {...common}
+          value={textValue}
+          onChange={(event) => updateValue(field.id, event.target.value)}
+        />
+      );
+    }
+    if (kind === "number") {
+      const minimum = constraints.minimum ?? constraints.min;
+      const maximum = constraints.maximum ?? constraints.max;
+      return (
+        <input
+          {...common}
+          type="number"
+          min={typeof minimum === "number" ? minimum : undefined}
+          max={typeof maximum === "number" ? maximum : undefined}
+          value={textValue}
+          onChange={(event) => updateValue(field.id, event.target.value)}
+        />
+      );
+    }
+    if (["date", "time", "datetime", "datetime_local"].includes(kind)) {
+      const inputType = kind === "datetime" || kind === "datetime_local" ? "datetime-local" : kind;
+      return (
+        <input
+          {...common}
+          type={inputType}
+          value={textValue}
+          onChange={(event) => updateValue(field.id, event.target.value)}
+        />
+      );
+    }
+    if ((kind === "single_choice" || kind === "select") && options.length === 0) {
+      return (
+        <input
+          {...common}
+          type="text"
+          value={textValue}
+          onChange={(event) => updateValue(field.id, event.target.value)}
+        />
+      );
+    }
+    return (
+      <textarea
+        {...common}
+        className="human-json-input"
+        value={textValue}
+        placeholder={field.placeholder || "Enter a JSON value"}
+        onChange={(event) => updateValue(field.id, event.target.value)}
+      />
+    );
+  }
+
+  return (
+    <section
+      className="human-input-card"
+      aria-labelledby={`human-title-${request.requestId}`}
+      aria-live="polite"
+      role="region"
+    >
+      <div className="human-input-header">
+        <div className="human-input-icon"><CircleAlert size={15} /></div>
+        <div>
+          <div className="human-input-kicker">YOUR INPUT IS NEEDED</div>
+          <h3 id={`human-title-${request.requestId}`}>{request.title}</h3>
+        </div>
+      </div>
+      {request.description && <p className="human-input-description">{request.description}</p>}
+      <form
+        className="human-input-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          const firstAction = request.actions[0];
+          if (firstAction) void submit(firstAction.id);
+        }}
+      >
+        {request.fields.map((field) => {
+          const id = `human-${request.requestId}-${field.id}`;
+          return (
+            <div className="human-field" key={field.id}>
+              <label className="human-field-label" id={`${id}-label`} htmlFor={id}>
+                {field.label}{field.required && <span className="required-mark"> *</span>}
+              </label>
+              {field.description && <p className="human-field-description">{field.description}</p>}
+              {renderField(field)}
+              {errors[field.id] && <span className="human-field-error" id={`${id}-error`} role="alert">{errors[field.id]}</span>}
+            </div>
+          );
+        })}
+        {formError && <p className="human-field-error" role="alert">{formError}</p>}
+        <div className="human-input-actions">
+          {request.actions.map((action, index) => (
+            <button
+              className={`human-submit ${index === 0 ? "primary" : ""}`}
+              key={action.id}
+              type="button"
+              disabled={disabled || submitting}
+              onClick={() => void submit(action.id)}
+            >
+              {submitting && index === 0 ? "Submitting…" : action.label}
+            </button>
+          ))}
+        </div>
+      </form>
+    </section>
   );
 }
 

@@ -81,33 +81,33 @@ class ChatRunCreated(ApiModel):
 
 
 class HumanInputOption(ApiModel):
-    label: str
-    value: str
+    label: str = Field(min_length=1, max_length=200)
+    value: str = Field(min_length=1, max_length=200)
 
 
 class HumanInputField(ApiModel):
-    id: str
-    label: str
-    kind: str
+    id: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=200)
+    kind: str = Field(min_length=1, max_length=64)
     required: bool = False
-    description: str | None = None
-    placeholder: str | None = None
+    description: str | None = Field(default=None, max_length=1000)
+    placeholder: str | None = Field(default=None, max_length=500)
     constraints: dict[str, Any] = Field(default_factory=dict)
-    options: list[HumanInputOption] = Field(default_factory=list)
+    options: list[HumanInputOption] = Field(default_factory=list, max_length=100)
 
 
 class HumanInputAction(ApiModel):
-    id: str
-    label: str
+    id: str = Field(min_length=1, max_length=100)
+    label: str = Field(min_length=1, max_length=200)
 
 
 class HumanInputRequest(ApiModel):
-    request_id: str = Field(alias="requestId")
-    run_id: str = Field(alias="runId")
-    title: str
-    description: str | None = None
-    fields: list[HumanInputField]
-    actions: list[HumanInputAction]
+    request_id: str = Field(alias="requestId", min_length=1, max_length=100)
+    run_id: str = Field(alias="runId", min_length=1, max_length=100)
+    title: str = Field(min_length=1, max_length=200)
+    description: str | None = Field(default=None, max_length=4000)
+    fields: list[HumanInputField] = Field(max_length=40)
+    actions: list[HumanInputAction] = Field(min_length=1, max_length=20)
 
 
 class HumanInputResponse(ApiModel):
@@ -141,3 +141,9 @@ RunStreamEvent = RunEvent
 
 class HumanInputSubmitRequest(HumanInputResponse):
     pass
+
+
+class HumanInputSubmitResult(ApiModel):
+    request_id: str = Field(alias="requestId")
+    run_id: str = Field(alias="runId")
+    status: Literal["resuming", "cancelled"]
